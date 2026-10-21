@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# headsetctl — backend for the stikkx.headset Omarchy bar plugin.
+#
+# Unifies two worlds behind one CLI with JSON output:
+#   * Bluetooth headsets (PipeWire/WirePlumber via pactl + bluetoothctl):
+#     Hi-Fi music (A2DP, best codec) vs call (HFP/HSP + headset mic) vs
+#     LE Audio duplex (bap-duplex) — the logic of stikkx/headset-mode.
+#   * USB/2.4 GHz gaming headsets (SteelSeries Arctis 7 & co.) via
+#     Sapd/HeadsetControl: battery, sidetone, lights, chatmix, inactive
+#     time, EQ presets, …
+#
+# Usage:
+#   headsetctl status                         JSON snapshot of everything
+#   headsetctl mode [music|call|duplex|toggle] [card]
+#   headsetctl profile <card> <profile>       raw card profile switch
+#   headsetctl connect|disconnect <mac>
+#   headsetctl default-sink <sink>            also moves running streams
+#   headsetctl default-source <source>
+#   headsetctl autoswitch on|off              WirePlumber auto HFP switching
+#   headsetctl usb <headsetcontrol args…>     pass-through (JSON output)
+#   headsetctl setup [usb|bt]                 interactive install helper
+#
+# HEADSET_CARD=bluez_card.XX_… pins the Bluetooth card for mode/toggle.
+# HEADSETCTL_QUIET=1 suppresses the OSD/notification feedback.
+set -uo pipefail
+
+PLUGIN_ID="stikkx.headset"
+A2DP_ORDER=(a2dp-sink-ldac a2dp-sink-aptx_hd a2dp-sink-aptx_ll_duplex a2dp-sink-aptx_ll
+            a2dp-sink-aptx a2dp-sink-aac a2dp-sink-faststream_duplex a2dp-sink-sbc_xq a2dp-sink)
+
+die() { echo "headsetctl: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------- feedback ---
+
+feedback() { # glyph message [urgency]
+  [[ "${HEADSETCTL_QUIET:-0}" == 1 ]] && return 0
+  local payload
+  payload=$(jq -cn --arg i "$1" --arg m "$2" '{icon:$i, message:$m, duration:1600}')
+  if have omarchy-shell && omarchy-shell osd show "$payload" >/dev/null 2>&1; then
+    :
+  elif have notify-send; then
+    notify-send -u "${3:-low}" -a Headset "Headset" "$2"
+  fi
+  # Nudge the bar widget so the icon flips immediately (best effort).
+  have omarchy-shell && omarchy-shell "$PLUGIN_ID" refresh >/dev/null 2>&1 &
+  return 0
+}
+
+# ------------------------------------------------------------ bluetooth ---
+
+cards_json() { pactl -f json list cards 2>/dev/null || echo '[]'; }
+
+first_bt_card() {
+  cards_json | jq -r '[.[] | select(.name|startswith("bluez_card.")) | select(.active_profile != "off")][0].name // empty'
+}
+
+any_bt_card() {
+  cards_json | jq -r '[.[] | select(.name|startswith("bluez_card."))][0].name // empty'
+}
+
+card_profile() { cards_json | jq -r --arg c "$1" '.[] | select(.name==$c) | .active_profile'; }
+
+card_has_profile() { # card profile
+  cards_json | jq -e --arg c "$1" --arg p "$2" \
+    '.[] | select(.name==$c) | .profiles[$p].available == true' >/dev/null
+}
+
+best_a2dp() {
+  local card=$1 p
+  for p in "${A2DP_ORDER[@]}"; do
+    if card_has_profile "$card" "$p"; then printf '%s' "$p"; return; fi
+  done
+  printf 'a2dp-sink'
+}
+
+# Bluetooth nodes appear a moment after a profile switch — poll for them.
+find_node() { # sinks|sources  card-suffix
+  local n
+  for _ in $(seq 1 25); do
+    n=$(pactl list "$1" short 2>/dev/null | awk -v p="$2" '$2 ~ p {print $2; exit}')
+    if [[ -n "$n" ]]; then echo "$n"; return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+move_streams_to_sink() {
+  local sink=$1 id
+  pactl set-default-sink "$sink" || return 1
+  for id in $(pactl list sink-inputs short 2>/dev/null | awk '{print $1}'); do
+    pactl move-sink-input "$id" "$sink" 2>/dev/null || true
+  done
+}
+
+codec_label() {
+  local c=${1#a2dp-sink}; c=${c#-}; c=${c:-sbc}; c=${c%_duplex}
+  printf '%s' "${c^^}" | sed 's/_/ /g'
+}
+
+set_bt_mode() { # mode card
+  local mode=$1 card=$2 mac sink src mic target
+  mac=${card#bluez_card.}
+  case "$mode" in
+    call)
+      pactl set-card-profile "$card" headset-head-unit 2>/dev/null \
+        || pactl set-card-profile "$card" headset-head-unit-msbc 2>/dev/null \
+        || pactl set-card-profile "$card" headset-head-unit-cvsd 2>/dev/null \
+        || { feedback "󰋎" "Could not switch to call mode" critical; return 1; }
+      sink=$(find_node sinks "^bluez_output[.]$mac") && move_streams_to_sink "$sink"
+      src=$(find_node sources "^bluez_input[.]$mac") && pactl set-default-source "$src"
+      feedback "󰋎" "Call mode · headset mic"
+      ;;
+    duplex)
+      card_has_profile "$card" bap-duplex \
+        || { feedback "󰋎" "LE Audio duplex not available — run le-audio setup" critical; return 1; }
+      pactl set-card-profile "$card" bap-duplex \
+        || { feedback "󰋎" "Could not switch to LE Audio" critical; return 1; }
+      sink=$(find_node sinks "^bluez_output[.]$mac") && move_streams_to_sink "$sink"
+      src=$(find_node sources "^bluez_input[.]$mac") && pactl set-default-source "$src"
+      feedback "󰋎" "LE Audio · stereo + mic"
+      ;;
+    music)
+      target=$(best_a2dp "$card")
+      pactl set-card-profile "$card" "$target" \
+        || { feedback "󰋋" "A2DP unavailable — power-cycle the headset" critical; return 1; }
+      sink=$(find_node sinks "^bluez_output[.]$mac") && move_streams_to_sink "$sink"
+      mic=$(pactl list sources short 2>/dev/null | awk '$2 ~ /^alsa_input/ {print $2; exit}')
+      [[ -n "$mic" ]] && pactl set-default-source "$mic"
+      feedback "󰋋" "Hi-Fi · $(codec_label "$target")"
+      ;;
+    off)
+      pactl set-card-profile "$card" off && feedback "󰋋" "Headset audio off"
+      ;;
+    *) die "unknown mode: $mode" ;;
+  esac
+}
+
+bt_mode_of() { # profile -> music|call|duplex|off
+  case "$1" in
+    a2dp*) echo music ;;
+    headset-head-unit*|hfp*|hsp*) echo call ;;
+    bap-duplex) echo duplex ;;
+    bap*) echo music ;;
+    *) echo off ;;
+  esac
+}
+
+# Paired Bluetooth audio devices with live info, as a JSON array.
+bt_devices_json() {
+  have bluetoothctl || { echo '[]'; return; }
+  local mac info
+  {
+    while read -r _ mac _; do
+      [[ "$mac" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]] || continue
+      info=$(timeout 2 bluetoothctl info "$mac" 2>/dev/null) || continue
+      grep -q 'Icon: audio-' <<<"$info" || continue
+      jq -n --arg mac "$mac" --arg info "$info" '
+        def field($k): ($info | capture("\n\\s*" + $k + ": (?<v>[^\n]*)")?.v) // "";
+        {
+          mac: $mac,
+          name: (field("Alias") | if . == "" then $mac else . end),
+          icon: field("Icon"),
+          connected: (field("Connected") == "yes"),
+          trusted: (field("Trusted") == "yes"),
+          battery: ((field("Battery Percentage") | capture("\\((?<n>[0-9]+)\\)")?.n | tonumber?) // null),
+          leAudio: ($info | test("Audio Stream Control|0000184e"; "i"))
+        }'
+    done < <(timeout 3 bluetoothctl devices Paired 2>/dev/null | grep '^Device ')
+  } | jq -s '.'
+}
+
+bt_powered() {
+  timeout 2 bluetoothctl show 2>/dev/null | grep -q 'Powered: yes' && echo true || echo false
+}
+
+autoswitch_state() {
+  wpctl settings bluetooth.autoswitch-to-headset-profile 2>/dev/null \
+    | awk '/^Value:/{print $2; f=1} END{if(!f) print "true"}'
+}
+
+# ------------------------------------------------------------------ usb ---
+
+usb_json() {
+  if ! have headsetcontrol; then
+    echo '{"installed":false,"devices":[]}'
+    return
+  fi
+  local raw
+  raw=$(timeout 4 headsetcontrol -o json 2>/dev/null) || raw=""
+  jq -n --argjson r "${raw:-null}" '{installed:true, version: ($r.version // ""), devices: ($r.devices // [])}' 2>/dev/null \
+    || echo '{"installed":true,"devices":[]}'
+}
+
+# ---------------------------------------------------------------- status ---
+
+cmd_status() {
+  local cards sinks sources bt usb
+  cards=$(cards_json)
+  sinks=$(pactl -f json list sinks 2>/dev/null || echo '[]')
+  sources=$(pactl -f json list sources 2>/dev/null || echo '[]')
+  bt=$(bt_devices_json)
+  usb=$(usb_json)
+  jq -n \
+    --argjson cards "$cards" --argjson sinks "$sinks" --argjson sources "$sources" \
+    --argjson bt "$bt" --argjson usb "$usb" \
+    --arg defSink "$(pactl get-default-sink 2>/dev/null)" \
+    --arg defSource "$(pactl get-default-source 2>/dev/null)" \
+    --argjson powered "$(bt_powered)" \
+    --argjson autoswitch "$(autoswitch_state)" \
+    --argjson hasCtl "$(have headsetcontrol && echo true || echo false)" \
+    --argjson hasLe "$(have le-audio-setup && echo true || echo false)" '
+    def mode($p):
+      if ($p|startswith("a2dp")) then "music"
+      elif ($p|test("^(headset-head-unit|hfp|hsp)")) then "call"
+      elif $p == "bap-duplex" then "duplex"
+      elif ($p|startswith("bap")) then "music"
+      else "off" end;
+    def mini: {name, description, vendor: (.properties["device.vendor.id"] // ""), product: (.properties["device.product.id"] // ""), bus: (.properties["device.bus"] // ""), profile: (.properties["device.profile.name"] // "")};
+    {
+      defaultSink: $defSink,
+      defaultSource: $defSource,
+      autoswitch: $autoswitch,
+      btPowered: $powered,
+      headsetcontrol: $hasCtl,
+      leAudioSetup: $hasLe,
+      bluetooth: [ $bt[] as $d
+        | ("bluez_card." + ($d.mac | gsub(":"; "_"))) as $cn
+        | ([ $cards[] | select(.name == $cn) ][0]) as $card
+        | $d + {
+            card: (if $card then $cn else "" end),
+            profile: ($card.active_profile // ""),
+            mode: (if $card then mode($card.active_profile) else "off" end),
+            profiles: [ ($card.profiles // {}) | to_entries[]
+                        | select(.value.available)
+                        | {name: .key, description: .value.description} ],
+            sink: ([ $sinks[] | select(.name|startswith("bluez_output." + ($d.mac|gsub(":";"_")))) | .name ][0] // ""),
+            source: ([ $sources[] | select(.name|startswith("bluez_input." + ($d.mac|gsub(":";"_")))) | .name ][0] // "")
+          } ],
+      usb: ($usb + { devices: [ $usb.devices[] as $u
+        | ($u.id_vendor // "" | ascii_downcase) as $vid
+        | ($u.id_product // "" | ascii_downcase) as $pid
+        | $u + {
+            sinks: [ $sinks[] | mini | select(.vendor|ascii_downcase == $vid) | select($vid != "") ],
+            sources: [ $sources[] | mini | select(.vendor|ascii_downcase == $vid) | select($vid != "") | select(.name|test("monitor$")|not) ]
+          } ] })
+    }'
+}
+
+# ------------------------------------------------------------- commands ---
+
+cmd_mode() {
+  local mode=${1:-toggle} card=${2:-${HEADSET_CARD:-}} profile
+  [[ -z "$card" ]] && card=$(first_bt_card)
+  [[ -z "$card" ]] && card=$(any_bt_card)
+
+  if [[ -z "$card" ]]; then
+    # No Bluetooth headset: for USB headsets with a Game/Chat split (Arctis),
+    # "toggle" flips the default output between the two channels instead.
+    cmd_usb_channel_toggle && return 0
+    feedback "󰋋" "No headset connected" critical
+    return 1
+  fi
+
+  profile=$(card_profile "$card")
+  if [[ "$mode" == toggle ]]; then
+    case "$(bt_mode_of "$profile")" in
+      music) mode=call ;;
+      *) mode=music ;;
+    esac
+  fi
+  set_bt_mode "$mode" "$card"
+}
+
+cmd_usb_channel_toggle() {
+  local sinks cur next
+  sinks=$(cmd_status | jq -r '.usb.devices[0].sinks // [] | map(.name) | .[]')
+  [[ $(wc -l <<<"$sinks") -lt 2 || -z "$sinks" ]] && return 1
+  cur=$(pactl get-default-sink)
+  next=$(awk -v c="$cur" 'NR==1{first=$0} found{print; exit} $0==c{found=1} END{if(!found||NR==0) print first}' <<<"$sinks" | head -1)
+  [[ -z "$next" ]] && next=$(head -1 <<<"$sinks")
+  move_streams_to_sink "$next"
+  if [[ "$next" == *chat* ]]; then feedback "󰋎" "Chat channel"; else feedback "󰋋" "Game channel"; fi
+}
+
+cmd_usb() {
+  have headsetcontrol || die "headsetcontrol is not installed (run: headsetctl setup usb)"
+  headsetcontrol "$@" -o json
+}
+
+cmd_setup() {
+  case "${1:-usb}" in
+    usb)
+      echo "Installing HeadsetControl (Sapd/HeadsetControl) …"
+      if ! have headsetcontrol; then
+        if have omarchy; then omarchy pkg add headsetcontrol; else sudo pacman -S --needed headsetcontrol; fi
+      fi
+      echo "Installing udev rules for non-root access …"
+      headsetcontrol -u | sudo tee /etc/udev/rules.d/70-headsets.rules >/dev/null
+      sudo udevadm control --reload-rules && sudo udevadm trigger
+      echo "Done. Re-plug the USB dongle if the headset is not detected."
+      ;;
+    bt)
+      # The WirePlumber tweaks from stikkx/headset-mode: mSBC (16 kHz calls),
+      # SBC-XQ, hardware volume and no silent auto-switch to HFP.
+      local dir="$HOME/.config/wireplumber/wireplumber.conf.d"
+      mkdir -p "$dir"
+      if [[ -e "$dir/50-bluez.conf" ]] && ! grep -q 'Installed by stikkx.headset' "$dir/50-bluez.conf"; then
+        cp "$dir/50-bluez.conf" "$dir/50-bluez.conf.bak.$(date +%s)"
+        echo "Backed up your existing $dir/50-bluez.conf"
+      fi
+      cat >"$dir/50-bluez.conf" <<'EOF'
+# Installed by stikkx.headset (from stikkx/headset-mode)
+monitor.bluez.properties = {
+  bluez5.enable-sbc-xq = true
+  bluez5.enable-msbc = true
+  bluez5.enable-hw-volume = true
+}
+
+wireplumber.settings = {
+  bluetooth.autoswitch-to-headset-profile = false
+}
+EOF
+      echo "Wrote $dir/50-bluez.conf — restarting WirePlumber …"
+      systemctl --user restart wireplumber
+      echo "Done. Power-cycle the headset once so it renegotiates codecs."
+      ;;
+    *) die "setup: expected usb or bt" ;;
+  esac
+}
+
+case "${1:-status}" in
+  status) cmd_status ;;
+  mode) shift; cmd_mode "$@" ;;
+  toggle) cmd_mode toggle ;;
+  music|call|duplex) cmd_mode "$1" "${2:-}" ;;
+  profile) [[ $# -ge 3 ]] || die "usage: headsetctl profile <card> <profile>"; pactl set-card-profile "$2" "$3" ;;
+  connect) timeout 15 bluetoothctl connect "${2:?mac}" ;;
+  disconnect) timeout 10 bluetoothctl disconnect "${2:?mac}" ;;
+  default-sink) move_streams_to_sink "${2:?sink}" ;;
+  default-source) pactl set-default-source "${2:?source}" ;;
+  autoswitch)
+    case "${2:-}" in
+      on|true) wpctl settings --save bluetooth.autoswitch-to-headset-profile true ;;
+      off|false) wpctl settings --save bluetooth.autoswitch-to-headset-profile false ;;
+      *) autoswitch_state ;;
+    esac ;;
+  usb) shift; cmd_usb "$@" ;;
+  setup) shift; cmd_setup "$@" ;;
+  -h|--help|help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

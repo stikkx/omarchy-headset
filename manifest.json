@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "stikkx.headset",
+  "name": "Headset",
+  "version": "1.0.0",
+  "author": "stikkx",
+  "description": "Bluetooth + USB headset control: Hi-Fi/Call/LE Audio mode, codecs, battery, and SteelSeries Arctis sidetone, lights, ChatMix and more via HeadsetControl",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Headset",
+    "description": "Shows the active headset mode; popup with all headset settings",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10,
+      "lowBatteryPercent": 15,
+      "reapplyOnConnect": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "number",
+        "label": "Refresh interval (seconds)",
+        "min": 3,
+        "max": 600,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "lowBatteryPercent",
+        "type": "number",
+        "label": "Low battery warning (%)",
+        "min": 0,
+        "max": 50,
+        "step": 5,
+        "defaultValue": 15
+      },
+      {
+        "key": "reapplyOnConnect",
+        "type": "bool",
+        "label": "Restore USB headset settings on connect",
+        "defaultValue": true
+      }
+    ]
+  }
+}
