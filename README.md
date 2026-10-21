@@ -118,3 +118,16 @@ headsetctl usb -s 64                       # any HeadsetControl flags
 
 `HEADSET_CARD=bluez_card.XX_…` pins which Bluetooth card the mode commands
 use.
+
+## Thanks
+
+A huge thank you to **[Sapd](https://github.com/Sapd)** and everyone who
+contributes to [HeadsetControl](https://github.com/Sapd/HeadsetControl). They
+spent years reverse-engineering the USB protocols of dozens of gaming headsets
+from SteelSeries, Logitech, Corsair, HyperX and others. Without that work, much
+of this plugin would not be possible: the battery level, sidetone, ChatMix, EQ
+presets and the rest of the USB headset controls all come from HeadsetControl.
+If it's useful to you too, consider starring or supporting the project.
+
+The Bluetooth mode switching builds on
+[headset-mode](https://github.com/stikkx/headset-mode).
