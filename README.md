@@ -1,4 +1,4 @@
-# stikkx.headset: Omarchy headset widget
+# stikkx.headset: Headset Mode for Omarchy
 
 A bar widget for the Omarchy shell that controls your Bluetooth headsets and
 USB gaming headsets (such as the SteelSeries Arctis 7) in one place. It uses

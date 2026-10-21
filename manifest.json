@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "stikkx.headset",
-  "name": "Headset",
+  "name": "Headset Mode",
   "version": "1.0.0",
   "author": "stikkx",
   "description": "Bluetooth + USB headset control: Hi-Fi/Call/LE Audio mode, codecs, battery, and SteelSeries Arctis sidetone, lights, ChatMix and more via HeadsetControl",
@@ -12,7 +12,7 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Headset",
+    "displayName": "Headset Mode",
     "description": "Shows the active headset mode; popup with all headset settings",
     "category": "Audio",
     "allowMultiple": false,
